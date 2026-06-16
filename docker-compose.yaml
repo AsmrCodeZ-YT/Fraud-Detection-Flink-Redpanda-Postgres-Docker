@@ -1,0 +1,269 @@
+networks:
+  fraud-net:
+    driver: bridge
+
+volumes:
+  redpanda_data:
+  postgres_data:
+  grafana_data:
+  prometheus_data:
+
+services:
+
+  # ─────────────────────────────────────────────
+  # RedPanda (Kafka-compatible broker + Schema Registry built-in)
+  # ─────────────────────────────────────────────
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    container_name: redpanda
+    networks: [fraud-net]
+    command:
+      - redpanda
+      - start
+      - --smp 2
+      - --memory 2G
+      - --reserve-memory 0M
+      - --overprovisioned
+      - --kafka-addr internal://0.0.0.0:29092,external://0.0.0.0:9092
+      - --advertise-kafka-addr internal://redpanda:29092,external://localhost:9092
+      - --schema-registry-addr http://0.0.0.0:8081
+      - --pandaproxy-addr http://0.0.0.0:8082
+      - --advertise-pandaproxy-addr http://localhost:8082
+      - --default-log-level=warn
+    ports:
+      - "9092:9092"
+      - "8081:8081"   # Schema Registry
+      - "8082:8082"   # Pandaproxy REST
+      - "9644:9644"   # Admin / metrics
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.*true' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  
+  # Topic + Schema init
+  redpanda-init:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    container_name: redpanda-init
+    networks: [fraud-net]
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      rpk --brokers redpanda:29092 topic create transactions --replicas 1 --topic-config retention.ms=3600000 || true
+      rpk --brokers redpanda:29092 topic create fraud-alerts --replicas 1 || true
+      rpk --brokers redpanda:29092 topic create clean-transactions --replicas 1 || true
+      rpk --brokers redpanda:29092 topic create dead-letter-queue --replicas 1 || true
+      echo 'Topics ready!'
+      "
+    restart: "no"
+
+  redpanda-console:
+    image: redpandadata/console:v2.8.15
+    container_name: redpanda-console
+    networks: [fraud-net]
+    depends_on: 
+      redpanda:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./redpanda/console-config.yaml:/app/config.yaml
+    environment:
+      CONFIG_FILEPATH: /app/config.yaml
+
+  # ─────────────────────────────────────────────
+  # Apache Flink Cluster
+  # ─────────────────────────────────────────────
+  jobmanager:
+    build:
+      context: ./flink_job
+      dockerfile: Dockerfile
+    image: fraud-flink:1.18
+    container_name: flink-jobmanager
+    networks: [fraud-net]
+    command: jobmanager
+    ports:
+      - "8088:8081"   # Flink Web UI
+      - "9249:9249"   # Prometheus metrics
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        parallelism.default: 2
+        state.backend: rocksdb
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        execution.checkpointing.interval: 30s
+        metrics.reporter.prometheus.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prometheus.port: 9249
+        web.submit.enable: true
+    volumes:
+      - ./flink_job:/opt/flink/usrlib
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/overview || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  taskmanager:
+    build:
+      context: ./flink_job
+      dockerfile: Dockerfile
+    image: fraud-flink:1.18
+    container_name: flink-taskmanager
+    networks: [fraud-net]
+    command: taskmanager
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 2
+        taskmanager.memory.process.size: 2048m
+        metrics.reporter.prometheus.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prometheus.port: 9249
+    volumes:
+      - ./flink_job:/opt/flink/usrlib
+
+  # # Job submitter (runs once and exits)
+  flink-job-submitter:
+    build:
+      context: ./flink_job
+      dockerfile: Dockerfile
+    image: fraud-flink:1.18
+    container_name: flink-job-submitter
+    networks: [fraud-net]
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:29092
+      POSTGRES_URL: jdbc:postgresql://postgres:5432/fraud_detection
+      POSTGRES_USER: fraud_user
+      POSTGRES_PASSWORD: fraud_pass
+      HIGH_AMOUNT_THRESHOLD: "10000"
+      VELOCITY_MAX_TRANSACTIONS: "5"
+      VELOCITY_WINDOW_SECONDS: "60"
+      LATE_TRANSACTION_HOURS: "1"
+    command: >
+      bash -c "
+        echo 'Waiting for Flink cluster...' &&
+        sleep 10 &&
+        echo 'Submitting fraud detection job...' &&
+        flink run \
+          -m jobmanager:8081 \ 
+          -py /opt/flink/usrlib/fraud_detector.py \
+          -pyfs /opt/flink/usrlib \
+          -pyexec python3 && 
+        echo 'Job submitted!'
+      "
+    volumes:
+      - ./flink_job:/opt/flink/usrlib
+    restart: "no"
+
+  # # ─────────────────────────────────────────────
+  # # PostgreSQL
+  # # ─────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    networks: [fraud-net]
+    environment:
+      POSTGRES_DB: fraud_detection
+      POSTGRES_USER: fraud_user
+      POSTGRES_PASSWORD: fraud_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraud_user -d fraud_detection"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: postgres-exporter
+    networks: [fraud-net]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATA_SOURCE_NAME: "postgresql://fraud_user:fraud_pass@postgres:5432/fraud_detection?sslmode=disable"
+    ports:
+      - "9187:9187"
+
+  # # ─────────────────────────────────────────────
+  # # Transaction Producer (Python)
+  # # ─────────────────────────────────────────────
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: transaction-producer
+    networks: [fraud-net]
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+    environment:
+      REDPANDA_BROKERS: redpanda:29092
+      SCHEMA_REGISTRY_URL: http://redpanda:8081
+      TRANSACTIONS_PER_SECOND: "200"   # ← increase for load test
+      FRAUD_RATE: "0.30"
+      BURST_MODE: "false"
+      METRICS_PORT: "8000"
+      LOG_EVERY_N: "500"
+    ports:
+      - "8000:8000"   # Prometheus /metrics
+
+  # # ─────────────────────────────────────────────
+  # # Prometheus
+  # # ─────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.48.1
+    container_name: prometheus
+    networks: [fraud-net]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-lifecycle'
+
+  # # ─────────────────────────────────────────────
+  # # Grafana
+  # # ─────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.2.3
+    container_name: grafana
+    networks: [fraud-net]
+    depends_on: [prometheus, postgres]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: grafana-piechart-panel,grafana-clock-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards

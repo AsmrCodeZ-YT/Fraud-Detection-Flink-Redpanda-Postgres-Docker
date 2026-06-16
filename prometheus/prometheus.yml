@@ -1,0 +1,32 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+
+  # Transaction Producer
+  - job_name: 'fraud-producer'
+    static_configs:
+      - targets: ['producer:8000']
+    metrics_path: /metrics
+
+  # Flink JobManager
+  - job_name: 'flink-jobmanager'
+    static_configs:
+      - targets: ['jobmanager:9249']
+
+  # Flink TaskManager
+  - job_name: 'flink-taskmanager'
+    static_configs:
+      - targets: ['taskmanager:9249']
+
+  # PostgreSQL Exporter
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  # RedPanda (built-in Prometheus metrics on port 9644)
+  - job_name: 'redpanda'
+    static_configs:
+      - targets: ['redpanda:9644']
+    metrics_path: /metrics

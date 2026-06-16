@@ -1,0 +1,173 @@
+{
+  "title": "Fraud Detection – Real-Time",
+  "uid": "fraud-detection-v1",
+  "tags": ["fraud", "flink", "redpanda"],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Transactions / sec",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "datasource": "Prometheus",
+      "options": { "colorMode": "background", "graphMode": "area", "orientation": "auto" },
+      "fieldConfig": {
+        "defaults": { "thresholds": { "steps": [{"color":"green","value":null},{"color":"yellow","value":500},{"color":"red","value":2000}] }, "unit": "reqps" }
+      },
+      "targets": [{ "expr": "rate(generator_transactions_total[30s])", "legendFormat": "TPS" }]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Fraud Rate %",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "datasource": "Prometheus",
+      "options": { "colorMode": "background" },
+      "fieldConfig": {
+        "defaults": { "thresholds": { "steps": [{"color":"green","value":null},{"color":"yellow","value":15},{"color":"red","value":30}] }, "unit": "percent" }
+      },
+      "targets": [{
+        "expr": "100 * rate(generator_transactions_total{tx_type!=\"normal\"}[1m]) / rate(generator_transactions_total[1m])",
+        "legendFormat": "Fraud %"
+      }]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Total Frauds Detected",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "datasource": "PostgreSQL",
+      "options": { "colorMode": "background" },
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "red", "mode": "fixed" } } },
+      "targets": [{ "rawSql": "SELECT COUNT(*) AS value FROM fraud_records", "format": "table" }]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Valid Transactions",
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+      "datasource": "PostgreSQL",
+      "options": { "colorMode": "background" },
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "green", "mode": "fixed" } } },
+      "targets": [{ "rawSql": "SELECT COUNT(*) AS value FROM valid_transactions", "format": "table" }]
+    },
+    {
+      "id": 5, "type": "stat", "title": "Avg Risk Score",
+      "gridPos": { "x": 16, "y": 0, "w": 4, "h": 4 },
+      "datasource": "PostgreSQL",
+      "options": { "colorMode": "background" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "steps": [{"color":"green","value":null},{"color":"yellow","value":50},{"color":"red","value":80}] }
+        }
+      },
+      "targets": [{ "rawSql": "SELECT ROUND(AVG(risk_score)::numeric, 1) AS value FROM fraud_records WHERE created_at >= NOW() - INTERVAL '5 minutes'", "format": "table" }]
+    },
+    {
+      "id": 6, "type": "stat", "title": "Produce Errors",
+      "gridPos": { "x": 20, "y": 0, "w": 4, "h": 4 },
+      "datasource": "Prometheus",
+      "options": { "colorMode": "background" },
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "orange", "mode": "fixed" } } },
+      "targets": [{ "expr": "generator_produce_errors_total", "legendFormat": "Errors" }]
+    },
+
+    {
+      "id": 10, "type": "timeseries", "title": "Transaction Throughput (TPS)",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "lineWidth": 2 } } },
+      "targets": [
+        { "expr": "rate(generator_transactions_total{tx_type=\"normal\"}[30s])", "legendFormat": "Normal" },
+        { "expr": "rate(generator_transactions_total{tx_type!=\"normal\"}[30s])", "legendFormat": "Fraud/Anomaly" },
+        { "expr": "rate(generator_transactions_total[30s])", "legendFormat": "Total" }
+      ]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Fraud Detections per Minute (by Type)",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "datasource": "PostgreSQL",
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [{
+        "rawSql": "SELECT date_trunc('minute', created_at) AS time, fraud_type AS metric, COUNT(*) AS value FROM fraud_records WHERE $__timeFilter(created_at) GROUP BY 1,2 ORDER BY 1",
+        "format": "time_series"
+      }]
+    },
+
+    {
+      "id": 20, "type": "piechart", "title": "Fraud Distribution by Type",
+      "gridPos": { "x": 0, "y": 12, "w": 8, "h": 8 },
+      "datasource": "PostgreSQL",
+      "options": { "pieType": "donut", "legendDisplayMode": "table" },
+      "targets": [{
+        "rawSql": "SELECT fraud_type AS metric, COUNT(*) AS value FROM fraud_records GROUP BY fraud_type ORDER BY value DESC",
+        "format": "table"
+      }]
+    },
+    {
+      "id": 21, "type": "barchart", "title": "Fraud by Type (Last Hour)",
+      "gridPos": { "x": 8, "y": 12, "w": 8, "h": 8 },
+      "datasource": "PostgreSQL",
+      "targets": [{
+        "rawSql": "SELECT fraud_type AS metric, COUNT(*) AS value FROM fraud_records WHERE created_at >= NOW() - INTERVAL '1 hour' GROUP BY fraud_type ORDER BY value DESC",
+        "format": "table"
+      }]
+    },
+    {
+      "id": 22, "type": "timeseries", "title": "Risk Score Distribution Over Time",
+      "gridPos": { "x": 16, "y": 12, "w": 8, "h": 8 },
+      "datasource": "PostgreSQL",
+      "targets": [{
+        "rawSql": "SELECT date_trunc('minute', created_at) AS time, AVG(risk_score) AS \"Avg Risk\", MAX(risk_score) AS \"Max Risk\", MIN(risk_score) AS \"Min Risk\" FROM fraud_records WHERE $__timeFilter(created_at) GROUP BY 1 ORDER BY 1",
+        "format": "time_series"
+      }]
+    },
+
+    {
+      "id": 30, "type": "table", "title": "Latest Fraud Alerts",
+      "gridPos": { "x": 0, "y": 20, "w": 24, "h": 8 },
+      "datasource": "PostgreSQL",
+      "fieldConfig": {
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "risk_score" }, "properties": [{ "id": "thresholds", "value": { "steps": [{"color":"yellow","value":40},{"color":"orange","value":70},{"color":"red","value":90}] } }, { "id": "custom.displayMode", "value": "color-background" }] },
+          { "matcher": { "id": "byName", "options": "amount" }, "properties": [{ "id": "unit", "value": "currencyUSD" }] }
+        ]
+      },
+      "options": { "sortBy": [{ "displayName": "created_at", "desc": true }] },
+      "targets": [{
+        "rawSql": "SELECT fraud_id, transaction_id, account_id, amount, currency, merchant, fraud_type, fraud_reason, risk_score, detected_at FROM fraud_records ORDER BY created_at DESC LIMIT 50",
+        "format": "table"
+      }]
+    },
+
+    {
+      "id": 40, "type": "timeseries", "title": "Produce Latency (p50 / p99)",
+      "gridPos": { "x": 0, "y": 28, "w": 12, "h": 6 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.5,  rate(generator_produce_latency_seconds_bucket[1m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.99, rate(generator_produce_latency_seconds_bucket[1m]))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 41, "type": "timeseries", "title": "Kafka Queue Depth",
+      "gridPos": { "x": 12, "y": 28, "w": 12, "h": 6 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "generator_kafka_queue_size", "legendFormat": "Queue Size" }]
+    },
+
+    {
+      "id": 50, "type": "table", "title": "Top Fraudulent Accounts",
+      "gridPos": { "x": 0, "y": 34, "w": 12, "h": 6 },
+      "datasource": "PostgreSQL",
+      "targets": [{
+        "rawSql": "SELECT account_id, COUNT(*) AS fraud_count, MAX(risk_score) AS max_risk, ROUND(SUM(ABS(amount))::numeric,2) AS total_blocked_usd, ARRAY_TO_STRING(ARRAY_AGG(DISTINCT fraud_type), ', ') AS fraud_types FROM fraud_records GROUP BY account_id ORDER BY fraud_count DESC LIMIT 10",
+        "format": "table"
+      }]
+    },
+    {
+      "id": 51, "type": "table", "title": "Fraud by Currency",
+      "gridPos": { "x": 12, "y": 34, "w": 12, "h": 6 },
+      "datasource": "PostgreSQL",
+      "targets": [{
+        "rawSql": "SELECT COALESCE(currency,'UNKNOWN') AS currency, COUNT(*) AS count, ROUND(SUM(ABS(amount))::numeric,2) AS total_amount FROM fraud_records GROUP BY currency ORDER BY count DESC",
+        "format": "table"
+      }]
+    }
+  ]
+}
